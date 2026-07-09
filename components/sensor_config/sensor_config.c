@@ -218,7 +218,7 @@ void init_default_sensors()
         [CHLORINE_NC]     = {"Chlorine NC",       "CLO_NC",  true, true, 0.0, 1.00, 0.0, false},
         [WEIGHT_SENSOR]   = {"Weight Sensor",     "WGT",     true, true, 0.0, 1.00, 0.0, false},
         [TURBIDITY]       = {"Turbidity",         "TBD",     true, false,0.0, 1.00, 0.0, false},
-        [SW1_mod]         = {"Flow Switch",          "FLOW_SW", true, false,0.0, 1.00, 0.0, false},
+        [SW1_mod]         = {"Flow Switch",       "FLOW_SW", true, false,0.0, 1.00, 0.0, false},
         [SW2_mod]         = {"Switch 2",          "SW2",     true, false,0.0, 1.00, 0.0, false},
         // [UFM_Test]        = {"Ultrasonic Test",   "UFM-T",   true, true, 0.0, 1.00, 0.0, false},
         [UFM1_FLOW]       = {"Ultrasonic Flow1",  "UFM1F",   true, true, 0.0, 1.00, 0.0, false},
