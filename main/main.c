@@ -1540,18 +1540,34 @@ void collect_and_log(void)
     ESP_LOGI("POLL", "Collecting sensor data...");
     sensor_data_colleccted = false;
 
-    write_SR(GSM_en, HIGH);          // Power modem ON early — gets free 10s warmup
-    if (!get_is_failed()) {
-        gsm_requires_init = true;    // Normal cycle: allow cold init if modem was off
-    } else {
-        ESP_LOGW("POLL", "Backlog pending — keeping modem session without forced re-init");
-    }
-    write_SR(IO_12V, HIGH);
+	if (status.battery_level < 20.0f) {
+		ESP_LOGW("POLL", "Battery %.2f%% < 20%% — keeping GSM modem OFF this cycle to let it recover", status.battery_level);
+		write_SR(GSM_en, LOW);
+	} else {
+		write_SR(GSM_en, HIGH);          // Power modem ON early — gets free 10s warmup
+		if (!get_is_failed()) {
+			gsm_requires_init = true;
+		} else {
+			ESP_LOGW("POLL", "Backlog pending — keeping modem session without forced re-init");
+		}
+	}
+
+    // write_SR(GSM_en, HIGH);          // Power modem ON early — gets free 10s warmup
+    // if (!get_is_failed()) {
+    //     gsm_requires_init = true;    // Normal cycle: allow cold init if modem was off
+    // } else {
+    //     ESP_LOGW("POLL", "Backlog pending — keeping modem session without forced re-init");
+    // }
+
+
+	/*Older version of data read from sensor
+  
+	write_SR(IO_12V, HIGH);
     write_SR(SEN_RS485_en, HIGH);
 
     vTaskDelay(10000 / portTICK_PERIOD_MS);  // Sensors stabilize + modem boots in parallel
 
-    /* Sensor Data */
+    // Sensor Data Collection Loop 
     while(1)
     {
         for( SensorSelect = 0; SensorSelect < MODBUS_Sensor_Count(); SensorSelect++)
@@ -1566,6 +1582,145 @@ void collect_and_log(void)
 
     write_SR(IO_12V, LOW);
     write_SR(SEN_RS485_en, LOW);
+	*/
+
+	//UPDATED AFTER SEPARATING PH LOADCELL READING BEFORE CUTTING 12V BUS POWER
+
+	/* ---- clean flags for this cycle, a clean slate so nothing from last cycle's results leaks into this cycle's pass/fail tracking. ---- */
+    // for (int i = 0; i < SENSOR_TYPE_COUNT; i++) modbus_response_status[i] = false; //"did this sensor answer successfully this cycle."
+
+    /* ============================================================
+       PHASE 1 — pH ONLY.
+       pH is powered externally/always-on, so U17 (IO_12V) stays OFF
+       here — every other RS485 field sensor stays unpowered/silent.
+       U14 (SEN_RS485_en) must still go HIGH: it powers U10, the local
+       transceiver the ESP32 uses to talk on the A/B lines at all.
+       ============================================================ */
+	write_SR(IO_12V, LOW);					 // 12v BUS off
+	ESP_LOGI("IO_12V", "12V BUS OFF at start of sensor reads");
+	
+    write_SR(SEN_RS485_en, HIGH);            // U14 ON — transceiver powered
+    vTaskDelay(200 / portTICK_PERIOD_MS);    // let U10 settle
+
+    ESP_LOGI("PH_DBG", "Sending PH modbus request now");
+    SensorSelect = PH;
+    sensor_modbus_requests();
+    CHECK_BLE_INTERRUPT();
+
+    ESP_LOGI("PH_DBG", "Sending WEIGHT_SENSOR (load cell) modbus request now");
+    SensorSelect = WEIGHT_SENSOR;
+    sensor_modbus_requests();
+    CHECK_BLE_INTERRUPT();
+
+    process_data_modbus();                   // finalizes sensors[PH] and sensors[WEIGHT_SENSOR]
+
+    /* snapshot both — Phase 2 wipes modbus_response_status[] before
+       we get to log them, so save now and restore after Phase 2 */
+    bool  ph_ok   = sensors[PH].response_ok;
+    float ph_val  = sensors[PH].value;
+    bool  wgt_ok  = sensors[WEIGHT_SENSOR].response_ok;
+    float wgt_val = sensors[WEIGHT_SENSOR].value;
+
+	ESP_LOGW("PH_DBG", "t=%lld us: PH read complete, val=%.2f", (long long)esp_timer_get_time(), ph_val);
+	ESP_LOGW("PH_DBG", "Holding %d ms before enabling 12V bus (pH settle)", 3000);
+	vTaskDelay(3000 / portTICK_PERIOD_MS);
+    /* ============================================================
+       PHASE 2 — every other sensor. Now power the field-sensor
+       12V rail (U17/IO_12V) as well.
+       ============================================================ */
+	ESP_LOGW("PH_DBG", "t=%lld us: IO_12V -> HIGH", (long long)esp_timer_get_time()); //6/8 exact time of ph read complete
+    write_SR(IO_12V, HIGH); //6/8
+	ESP_LOGI("IO_12V", "12V BUS ON for Phase 2 sensor reads");
+    // vTaskDelay(10000 / portTICK_PERIOD_MS);
+	vTaskDelay(500 / portTICK_PERIOD_MS);   // short settle after the rail switches
+
+	SensorSelect = PH;
+	sensor_modbus_requests();
+	process_data_modbus();
+	float ph_after_12v = sensors[PH].value;
+	bool  ph_after_12v_ok = sensors[PH].response_ok;
+
+	ESP_LOGW("PH_DBG", "pH before 12V: %.3f | pH ~0.5s after 12V ON: %.3f | delta=%.3f",
+			ph_val, ph_after_12v, ph_after_12v - ph_val);
+
+	// THIS VERSION IS ALSO FOR BEFORE 12V AND THE COMMENTED PART INCLUDES THE READINGS FROM AFTER 12V (shows both values in app refershes auto in 2 secs)
+	// /* When BLE is connected, collect_and_log() re-fires every ~10-20 s (BLE
+	//    fast-log mode) instead of the normal ~60 s cadence. That's not enough
+	//    time since the 12V bus was last switched OFF for TDS-ion deflection on
+	//    the shared flow cell to fully decay, so the Phase 1 (pre-12V) pH read
+	//    is skewed while BLE is active. The Phase 2 read (~0.5s after 12V ON)
+	//    isn't subject to that carry-over, so prefer it whenever BLE is connected. */
+	// bool ble_active_this_cycle = is_ble_connected_();
+	// if (ble_active_this_cycle && ph_after_12v_ok) {
+	// 	ESP_LOGW("PH_DBG", "BLE connected — using ph_before_12v (%.3f) instead of "
+	// 			"after 12V value (%.3f) as reported PH", ph_val, ph_after_12v);
+	// 	// ph_val = ph_after_12v;
+	// 	ph_ok  = ph_val;
+	// }
+
+	// bool ble_active_this_cycle = is_ble_connected_();
+	// if (ble_active_this_cycle) {
+	// 	ESP_LOGW("PH_DBG", "BLE connected — keeping ph_before_12v (%.3f) as reported PH "
+	// 			"(after_12v=%.3f, delta=%.3f)", ph_val, ph_after_12v, ph_after_12v - ph_val);
+	// }
+	// // THIS USES BEFORE 12V READINGS FROM PH AS IT WERE MORE STABLE IN OBSERVATION. + before 12v value only in app.
+	// /* Restore sensors[PH] to the Phase-1 (pre-12V) value RIGHT NOW, not at the
+	//    end of the cycle. The independent 5-second BLE poller (POLL task, ~line
+	//    369) reads sensors[PH].value live and doesn't know about phases — if we
+	//    leave ph_after_12v sitting in sensors[PH] for the ~9.5s+rest-of-Phase-2
+	//    duration below, that poller can catch it and flash the after-12V value
+	//    to the app. Restoring immediately closes that window completely. */
+	// sensors[PH].response_ok = ph_ok;
+	// sensors[PH].value       = ph_val;
+
+	// THIS VERSION IS OF EVENING AUGUST 11
+	// THIS USES PH VALUE AFTER 0.5S AND USING IT AS ITS VALUES ARE MORE STABLE THAN BEFORE 12V ( updates the same value only in app as well)
+	// AS in before 12v there are some values out of curve means 8.1,8.1,8.2,8.1 and then 8.4 then 8.1 like these
+	// and in this after 0.5s 12v, values are more stable like 8.11,8.12,8.12,8.14,8.2,8.1 
+	// JUST NEED TO CONFIRM THIS WITH PH SAMPLES OTHER THAN 7.
+	// Confirmed with 10 ph samples as well, readings are good.
+	/* When BLE is connected, collect_and_log() re-fires every ~10-20 s (BLE
+	   fast-log mode) instead of the normal ~60 s cadence. That's not enough
+	   time since the 12V bus was last switched OFF for TDS-ion deflection on
+	   the shared flow cell to fully decay, so the Phase 1 (pre-12V) pH read
+	   is skewed while BLE is active. The Phase 2 read (~0.5s after 12V ON)
+	   isn't subject to that carry-over, so prefer it whenever BLE is connected. */
+	bool ble_active_this_cycle = is_ble_connected_();
+	if (ble_active_this_cycle && ph_after_12v_ok) {
+		ESP_LOGW("PH_DBG", "BLE connected — using ph_after_12v (%.3f) instead of "
+				"pre-12V value (%.3f) as reported PH", ph_after_12v, ph_val);
+		ph_val = ph_after_12v;
+		ph_ok  = ph_after_12v_ok;
+	}
+
+	sensors[PH].response_ok = ph_ok;
+	sensors[PH].value       = ph_val;
+
+	vTaskDelay(9500 / portTICK_PERIOD_MS);  // rest of your original 10s settle
+
+    while(1)
+    {	//for loop walks every sensor index and, skipping PH/WEIGHT_SENSOR (already handled in Phase 1)
+        for( SensorSelect = 0; SensorSelect < MODBUS_Sensor_Count(); SensorSelect++)
+        {
+            if (SensorSelect == PH || SensorSelect == WEIGHT_SENSOR) continue;  // already read in Phase 1
+            sensor_modbus_requests();
+            CHECK_BLE_INTERRUPT();
+        }
+        process_data_modbus();
+        break;
+    }
+	write_SR(IO_12V, LOW);    //OFF state until the next scheduled read cycle
+	ESP_LOGI("IO_12V", "12V BUS OFF after Phase 2 sensor reads");
+	/* did not LOW the SEN_RS485_en here because the disbling it here was observing a reading error of 0.2 ph unit
+	*/
+	// write_SR(SEN_RS485_en, LOW);   // U14 OFF too, until next cycle's Phase 1
+	// ESP_LOGI("SEN_RS485_en", "RS485 transceiver OFF after Phase 2 sensor reads");
+	
+    sensors[PH].response_ok = ph_ok;
+    sensors[PH].value       = ph_val;
+    sensors[WEIGHT_SENSOR].response_ok = wgt_ok;
+    sensors[WEIGHT_SENSOR].value       = wgt_val;
+
 
     /* Use scheduled slot timestamp so SPIFFS logs stay exactly interval-spaced
        even if backlog posting delays execution.
@@ -2129,7 +2284,7 @@ void sensor_modbus_requests()
 
 
 	// vTaskDelay(10 / portTICK_PERIOD_MS);
-	// write_SR(SEN_RS485_en,LOW);
+	// write_SR(SEN_RS485_en, LOW);
 	
 }
 
@@ -2355,7 +2510,16 @@ void adc_init_custom() {
     adc2_config_channel_atten(ADC_CH_1, ADC_ATTEN_DB);
     adc2_config_channel_atten(ADC_CH_2, ADC_ATTEN_DB);
 
-    esp_adc_cal_characterize(ADC_UNIT_2, ADC_ATTEN_DB, ADC_WIDTH_BIT, ADC_VREF, &adc_chars);
+    esp_adc_cal_value_t val_type = esp_adc_cal_characterize(
+        ADC_UNIT_2, ADC_ATTEN_DB, ADC_WIDTH_BIT, ADC_VREF, &adc_chars);
+
+    if (val_type == ESP_ADC_CAL_VAL_EFUSE_TP) {
+        ESP_LOGI("ADC_CAL", "Using Two Point eFuse calibration");
+    } else if (val_type == ESP_ADC_CAL_VAL_EFUSE_VREF) {
+        ESP_LOGI("ADC_CAL", "Using eFuse Vref calibration (Vref=%umV)", (unsigned)adc_chars.vref);
+    } else {
+        ESP_LOGW("ADC_CAL", "Using DEFAULT Vref (%umV) — least accurate, no eFuse data on this chip!", (unsigned)ADC_VREF);
+    }
 }
 
 
@@ -2718,7 +2882,7 @@ void app_main(void)
 	vTaskDelay(2000 / portTICK_PERIOD_MS);
 	write_SR(GSM_en, HIGH);
 
-	write_SR(IO_12V, HIGH);
+	// write_SR(IO_12V, HIGH);
 
 	write_SR(LED, LOW);
 	
