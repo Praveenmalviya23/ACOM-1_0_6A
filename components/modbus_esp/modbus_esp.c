@@ -443,9 +443,10 @@ uint16_t modbus_crc(uint8_t *data, uint8_t len) {
 
 
 float decodeModbusResponse_TDS(uint8_t *receivedData)
-{ //scale factor updated to 0.5 from 0.7 as per request on 30 june 2026
+{ //scale factor removed as requested by Prabhat sir in Isaki Site visit.
   uint16_t data = (receivedData[3] << 8) | receivedData[4];
-  float tds = (float) data * 0.5;
+  // float tds = (float) data * 0.5;
+  float tds = (float) data;
   return tds;
 }
 

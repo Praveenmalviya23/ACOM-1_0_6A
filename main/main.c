@@ -1,4 +1,4 @@
-//// tds scaling factor adjusted to 0.5 from 0.7 as per request on 30 june 2026 from Rohit
+// TDS scale factor removed as requested by Prabhat sir in Isaki Site visit. now uses EC value.
 #include <stdio.h>
 #include <stdbool.h>
 #include <unistd.h>
@@ -1696,6 +1696,16 @@ void collect_and_log(void)
 	sensors[PH].response_ok = ph_ok;
 	sensors[PH].value       = ph_val;
 
+	/* Kick off battery/solar ADC sampling here, not at the top of the cycle.
+	   adc_sampling_task averages for 5s (100ms/sample) — it needs a quiet
+	   stretch with no RS485/modbus traffic on the bus, same as the old
+	   FLOW_SW behaviour (notify -> flat 10s delay, no sensor I/O). Phase 1
+	   above runs live PH/WEIGHT_SENSOR modbus requests, so sampling can't
+	   start until Phase 1 finishes. This 9500ms delay is clean until the
+	   remaining-sensor while(1) loop below, so the whole 5s window fits
+	   inside it undisturbed. */
+	xTaskNotify(adc_sampling_handle, 0, eNoAction);
+
 	vTaskDelay(9500 / portTICK_PERIOD_MS);  // rest of your original 10s settle
 
     while(1)
@@ -3055,7 +3065,9 @@ void app_main(void)
 
 				ESP_LOGW("MAIN-BLE", "BLE fast-log tick (every %d s)", BLE_LOG_INTERVAL_SEC);
 
-				xTaskNotify(adc_sampling_handle, 0, eNoAction);
+				// xTaskNotify(adc_sampling_handle, 0, eNoAction);
+				/* adc_sampling_handle is now notified inside collect_and_log()
++				   itself, after Phase 1 modbus reads finish — see comment there. */
 				xTaskNotify(flow_task_handle,    0, eNoAction);
 				xTaskNotify(tempr_task_handle,   0, eNoAction);
 
@@ -3103,7 +3115,9 @@ void app_main(void)
 			pre_done  = false;
 			first_run = false;
 
-			xTaskNotify(adc_sampling_handle, 0, eNoAction);
+			// xTaskNotify(adc_sampling_handle, 0, eNoAction);
+			/* adc_sampling_handle is now notified inside collect_and_log()
++			   itself, after Phase 1 modbus reads finish — see comment there. */
 			xTaskNotify(flow_task_handle,    0, eNoAction);
 			xTaskNotify(tempr_task_handle,   0, eNoAction);
 			printf(" \n");
