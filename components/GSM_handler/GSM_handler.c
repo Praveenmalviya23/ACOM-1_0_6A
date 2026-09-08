@@ -248,6 +248,7 @@ esp_err_t gsm_init(char *imei)
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
     if (!registered) {
+        uart_write_modem("AT+CSQ\r\n", "+CSQ:", 1500);
         ESP_LOGE("GSM_NET", "Network registration timeout after 24s — no network, saving to backlog");
         return ESP_FAIL;
     }
@@ -259,6 +260,17 @@ esp_err_t gsm_init(char *imei)
 
 esp_err_t start_internet(bool sim)
 {
+    /* Clean up any stuck HTTP session / PDP context left over from a previous
+       timed-out POST (e.g. modem reported +QHTTPPOST: 702 or similar).
+       Without this, the modem can refuse AT+QICSGP / AT+QIACT with ERROR
+       because it still thinks the old HTTP session or context is active.
+       Both commands are "best effort" — if nothing was stuck, the modem
+       just replies ERROR/OK harmlessly and we move on either way. */
+    uart_write_modem("AT+QHTTPSTOP\r\n", "OK", 3000);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    uart_write_modem("AT+QIDEACT=1\r\n", "OK", 5000);
+    vTaskDelay(pdMS_TO_TICKS(300));
+
     // APN setup — auth=1 (PAP) for Airtel for stable long-term IP leases.
     // Jio does not require authentication, auth=0 is fine.
     if (sim) {
@@ -323,14 +335,14 @@ esp_err_t configurl(void)
 
     snprintf(temp_buff, sizeof(temp_buff), "AT+QHTTPURL=%d,60\r\n", str_len);
 
-    if ( uart_write_modem(temp_buff, "CONNECT", 5000) == ESP_FAIL )
+    if ( uart_write_modem(temp_buff, "CONNECT", 10000) == ESP_FAIL )
     {
        ESP_LOGE("configurl","Connect Not detected - aborting after URL len setup failure\n");
         return ESP_FAIL;
     }
 
     
-    if ( uart_write_modem(cmd_url, "OK", 5000) == ESP_FAIL )
+    if ( uart_write_modem(cmd_url, "OK", 10000) == ESP_FAIL )
     {
         ESP_LOGE("configurl","OK Not detected - aborting after URL failure\n");
         return ESP_FAIL;
@@ -377,6 +389,12 @@ void gsm_post_secondary(const char *datasend)
     vTaskDelay(pdMS_TO_TICKS(500));
     clear_buffers();
 
+    /* Clear any stuck HTTP session from a previous failed/timed-out POST
+       before starting a new one — cheap, and prevents immediate ERROR
+       on AT+QHTTPPOST when the modem still thinks a session is busy. */
+    uart_write_modem("AT+QHTTPSTOP\r\n", "OK", 3000);
+    vTaskDelay(pdMS_TO_TICKS(200));
+
     char temp_buff[64] = "";
     int  body_len      = strlen(datasend);
  
@@ -398,7 +416,7 @@ void gsm_post_secondary(const char *datasend)
  
     /* Set secondary URL on modem — length must be URL only, no \r\n */
     snprintf(temp_buff, sizeof(temp_buff), "AT+QHTTPURL=%d,60\r\n", sec_url_len);
-    if (uart_write_modem(temp_buff, "CONNECT", 5000) == ESP_FAIL) {
+    if (uart_write_modem(temp_buff, "CONNECT", 10000) == ESP_FAIL) {
         ESP_LOGW("SEC_POST", "Secondary URL set failed - skipping");
         goto restore_primary;
     }
@@ -411,8 +429,9 @@ void gsm_post_secondary(const char *datasend)
  
     /* POST — send AT+QHTTPPOST with total length */
     ESP_LOGI("SEC_POST", "Posting to: " SECONDARY_GSM_URL);
-    snprintf(temp_buff, sizeof(temp_buff), "AT+QHTTPPOST=%d,77,20\r\n", total_len);
-    if (uart_write_modem(temp_buff, "CONNECT", 5000) == ESP_FAIL) {
+    // snprintf(temp_buff, sizeof(temp_buff), "AT+QHTTPPOST=%d,77,20\r\n", total_len);
+    snprintf(temp_buff, sizeof(temp_buff), "AT+QHTTPPOST=%d,77,60\r\n", total_len);
+    if (uart_write_modem(temp_buff, "CONNECT", 10000) == ESP_FAIL) {
         ESP_LOGW("SEC_POST", "Secondary CONNECT not received - skipping");
         goto restore_primary;
     }
@@ -572,6 +591,12 @@ esp_err_t gsm_post_data(const char *datasend)
      *   <JSON payload>
      */
 
+    /* Clear any stuck HTTP session from a previous failed/timed-out POST
+       before starting a new one — cheap, and prevents immediate ERROR
+       on AT+QHTTPPOST when the modem still thinks a session is busy. */
+    uart_write_modem("AT+QHTTPSTOP\r\n", "OK", 3000);
+    vTaskDelay(pdMS_TO_TICKS(200));
+
     int body_len  = strlen(datasend);
     /* Build the header block first so we know its exact length */
 
@@ -589,16 +614,22 @@ esp_err_t gsm_post_data(const char *datasend)
     int total_len  = header_len + body_len;   /* what the modem counts */
  
     char temp_buff[64] = "";
-    snprintf(temp_buff, sizeof(temp_buff), "AT+QHTTPPOST=%d,77,20\r\n", total_len);
+    // snprintf(temp_buff, sizeof(temp_buff), "AT+QHTTPPOST=%d,77,20\r\n", total_len);
+    snprintf(temp_buff, sizeof(temp_buff), "AT+QHTTPPOST=%d,77,60\r\n", total_len);
 
     // char temp_buff[50] = "";
     // int str_len = strlen(datasend);
     // snprintf(temp_buff, sizeof(temp_buff), "AT+QHTTPPOST=%d,77,20\r\n", str_len);
 
-    if( uart_write_modem(temp_buff, "CONNECT", 5000) == ESP_FAIL)
+    if( uart_write_modem(temp_buff, "CONNECT", 10000) == ESP_FAIL)
     {
-        ESP_LOGE("gsm_post_data", "Connect Not detected - aborting after POST len failure\n");
-        return ESP_FAIL;
+        ESP_LOGW("gsm_post_data", "Connect Not detected on 1st try — retrying once\n");
+        vTaskDelay(pdMS_TO_TICKS(1000));   // brief pause before retry
+        if( uart_write_modem(temp_buff, "CONNECT", 10000) == ESP_FAIL)
+        {
+            ESP_LOGE("gsm_post_data", "Connect Not detected - aborting after POST len failure\n");
+            return ESP_FAIL;
+        }
     }
        /* Concatenate HTTP header + JSON body into one buffer and send together.
      * The modem expects the full request (header + body) as a single stream
@@ -614,12 +645,12 @@ esp_err_t gsm_post_data(const char *datasend)
     memcpy(full_request + header_len, datasend, body_len);
     full_request[total_len] = '\0';
  
-    esp_err_t post_ret = uart_write_modem(full_request, "200", 20000);
+    esp_err_t post_ret = uart_write_modem(full_request, "200", 30000);
     free(full_request);
 
     if( post_ret == ESP_FAIL )
     {
-        ESP_LOGE("gsm_post_data", "200 Not detected - aborting after POST failure\n");
+        ESP_LOGE("gsm_post_data", "200 Not detected -Server response err. aborting after POST failure\n");
         return ESP_FAIL;
     }
 
@@ -799,7 +830,7 @@ esp_err_t get_gps_location(double *latitude, double *longitude, gps_callback_t c
     {
         ESP_LOGW("GPS", "GPS is off, Turning it on");
  
-        if( uart_write_modem("AT+QGPS=1\r\n", "OK", 3000) == ESP_FAIL)
+        if( uart_write_modem("AT+QGPS=1\r\n", "OK", 8000) == ESP_FAIL)
         {
             ESP_LOGE("GPS", "OK - aborting after GPS is OFF\n");
             return ESP_FAIL;

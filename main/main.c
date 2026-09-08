@@ -1,3 +1,4 @@
+// version 1_0_6A it will be. 
 // TDS scale factor removed as requested by Prabhat sir in Isaki Site visit. now uses EC value.
 #include <stdio.h>
 #include <stdbool.h>
@@ -126,6 +127,7 @@ static time_t get_realtime_rtc_ts(void);
 
 bool BLE_INTERRUPT = false;
 SemaphoreHandle_t BLE_INTERRUPTxMutex;
+SemaphoreHandle_t modem_uart_mutex;   // NEW: protects the shared GSM/GPS UART from being used by 2 tasks at once
 
 void print_binary(uint8_t value) {
     printf("Binary: ");
@@ -1341,11 +1343,11 @@ esp_err_t handle_gsm_post()
 			ESP_LOGE("POLL", "Failed to post failed data");
 			strcpy(status.gsm_post_status, "FAIL"); // Reset GSM post status
 			backlog_post_fail_streak++;
-			ESP_LOGW("POLL", "Backlog post fail streak: %u/10", backlog_post_fail_streak);
-			if (backlog_post_fail_streak >= 10) {
+			ESP_LOGW("POLL", "Backlog post fail streak: %u/3", backlog_post_fail_streak); //changed from 10 to 3
+			if (backlog_post_fail_streak >= 3) {
 				gsm_requires_init = true;
 				backlog_post_fail_streak = 0;
-				ESP_LOGW("POLL", "Backlog failed 10 times — forcing GSM re-init");
+				ESP_LOGW("POLL", "Backlog failed 3 times — forcing GSM re-init");
 			}
 			return ESP_FAIL;
 		}
@@ -1802,7 +1804,8 @@ void collect_and_log(void)
     /* GPS (only when needed) */
     if (check_GPS_data || config.latitude == 0.0 || config.longitude == 0.0)
     {
-        if (get_gps_location(&latitude, &longitude, CHECK_BLE_INTERRUPT) == ESP_OK)
+        xSemaphoreTake(modem_uart_mutex, portMAX_DELAY);   // NEW: grab the modem lock
+		if (get_gps_location(&latitude, &longitude, CHECK_BLE_INTERRUPT) == ESP_OK)
         {
             ESP_LOGI("GPS data", "Fetch Success");
             check_GPS_data = false;
@@ -1811,6 +1814,7 @@ void collect_and_log(void)
         {
             ESP_LOGE("GPS data", "Fetch Fail");
         }
+		xSemaphoreGive(modem_uart_mutex);
     }
 
     CHECK_BLE_INTERRUPT();
@@ -1946,7 +1950,9 @@ void post_data(void)
     else
     {
         ESP_LOGW("MAIN", " GSM Mode Active");
+        xSemaphoreTake(modem_uart_mutex, portMAX_DELAY);   // NEW: grab the modem lock
         handle_gsm_post();
+        xSemaphoreGive(modem_uart_mutex);                  // NEW: release the modem lock
     }
 
     /* Modem power-off after posting */
@@ -2864,6 +2870,7 @@ void app_main(void)
 	BLE_INT_QUEUE = xQueueCreate(1, sizeof(int));    // queue length = 1
     BLE_INT_POLL_PAUSED = xSemaphoreCreateBinary();
     BLE_INT_BLE_DONE = xSemaphoreCreateBinary();
+	modem_uart_mutex = xSemaphoreCreateMutex();      // NEW: create the modem lock before any task can use it
 
 	xTaskCreatePinnedToCore(btn_press_handler, "btn_press_handler", 8192, NULL, 5, NULL, 1);
 	xTaskCreate(flow_task, "FlowTask", 2048, NULL, 5, &flow_task_handle);
