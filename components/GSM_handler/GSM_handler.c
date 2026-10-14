@@ -9,6 +9,7 @@
 #include "logs_handler.h"
 #include "wifi_handler.h"
 
+// #define DEBUG_TEST_SECONDARY_ON_REJECT
 
 uint8_t *uart_data_rxd_ = NULL;
 int parse_gngga_lat_lon(const char *nmea_str, double *lat, double *lon);
@@ -19,6 +20,15 @@ void save_state_if_changed(size_t offset, bool wrapped, bool failed);
 // size_t curr_log_offset = 0;  // End of file in bytes
 static size_t failed_offset = 0;    // Where last failure happened
 static bool is_failed = false;
+
+static size_t  last_failed_try_offset = SIZE_MAX;
+static uint8_t same_offset_reject_count = 0;
+#define MAX_REJECT_RETRIES 5   /* only counts genuine server rejections, never network drops */
+
+static post_fail_reason_t last_post_fail_reason = POST_FAIL_NONE;
+post_fail_reason_t get_last_post_fail_reason(void) { 
+    return last_post_fail_reason;
+ }
 
 void delay_(int ms)
 {
@@ -444,11 +454,14 @@ void gsm_post_secondary(const char *datasend)
  
     esp_err_t ret = uart_write_modem(full_req, "+QHTTPPOST: 0,200", 8000);
     free(full_req);
+
+    printf("SEC_POST RAW RESPONSE: %s\n", UART2_data);   // DEBUG: see exactly what AWS returned
  
     if (ret == ESP_FAIL) {
         ESP_LOGI("SEC_POST", "Secondary POST success (AWS 200)");
     } else {
         uart_write_modem("AT+QHTTPREAD\r\n", "OK", 3000);
+        printf("SEC_POST RAW BODY: %s\n", UART2_data);    // DEBUG: full body after explicit read
         ESP_LOGW("SEC_POST", "Secondary POST - no 200 status, server response above");
     }
  
@@ -628,6 +641,7 @@ esp_err_t gsm_post_data(const char *datasend)
         if( uart_write_modem(temp_buff, "CONNECT", 10000) == ESP_FAIL)
         {
             ESP_LOGE("gsm_post_data", "Connect Not detected - aborting after POST len failure\n");
+            last_post_fail_reason = POST_FAIL_NO_NETWORK;      // NEW: no modem/network response at all
             return ESP_FAIL;
         }
     }
@@ -638,19 +652,31 @@ esp_err_t gsm_post_data(const char *datasend)
     char *full_request = malloc(total_len + 1);
     if( full_request == NULL )
     {
+        // malloc failure (~line 641) — device-side, not the record's fault
         ESP_LOGE("gsm_post_data", "malloc failed for full_request\n");
+        last_post_fail_reason = POST_FAIL_NO_NETWORK;          // NEW: treat as retry-forever, not a rejection
         return ESP_FAIL;
     }
     memcpy(full_request, http_header, header_len);
     memcpy(full_request + header_len, datasend, body_len);
     full_request[total_len] = '\0';
  
+    // the "200" wait (~line 648-655) — THIS is the ambiguous one, disambiguate it:
     esp_err_t post_ret = uart_write_modem(full_request, "200", 30000);
     free(full_request);
 
     if( post_ret == ESP_FAIL )
     {
-        ESP_LOGE("gsm_post_data", "200 Not detected -Server response err. aborting after POST failure\n");
+        if (strstr((const char *)UART2_data, "+QHTTPPOST:") != NULL) {
+            /* Modem DID get a status line back from the server — it's just not 200.
+            This is a real rejection (e.g. the 500 you captured earlier). */
+            ESP_LOGE("gsm_post_data", "Server responded but not 200: %s\n", UART2_data);
+            last_post_fail_reason = POST_FAIL_SERVER_REJECTED;   // NEW
+        } else {
+            /* Nothing came back at all — genuine connectivity/antenna/signal issue. */
+            ESP_LOGE("gsm_post_data", "200 Not detected -Server response err. aborting after POST failure\n");
+            last_post_fail_reason = POST_FAIL_NO_NETWORK;        // NEW
+        }
         return ESP_FAIL;
     }
 
@@ -667,6 +693,7 @@ esp_err_t gsm_post_data(const char *datasend)
     if (uart_write_modem("AT+QHTTPREAD\r\n", "OK", 5000) == ESP_FAIL) {
         printf("Fail response: %s\n", UART2_data);
         ESP_LOGE("gsm_post_data", "QHTTPREAD failed (no OK) - treating as failure");
+        last_post_fail_reason = POST_FAIL_NO_NETWORK;      // NEW: safe to retry indefinitely
         return ESP_FAIL;
     }
 
@@ -685,6 +712,7 @@ esp_err_t gsm_post_data(const char *datasend)
     }
 
     ESP_LOGE("gsm_post_data", "Unexpected server body after POST - treating as failure");
+    last_post_fail_reason = POST_FAIL_SERVER_REJECTED;     // NEW: counts toward the 10-try cap
     return ESP_FAIL;
     /* IMPORTANT:
        Do not modify backlog state here. This function is used both for:
@@ -1534,7 +1562,8 @@ post_status_t try_post_from_failed(size_t start_offset, bool is_wifi_post)
             continue;
         }
 
-        printf("Trying to Post: [%zu] %.*s\n", post_offset, 17, line);
+        // printf("Trying to Post: [%zu] %.*s\n", post_offset, 17, line);
+        printf("Trying to Post: [%zu] %s\n", post_offset, line);   // DEBUG: full payload, revert after testing
 
         esp_err_t post_result;
         if( is_wifi_post )
@@ -1546,12 +1575,48 @@ post_status_t try_post_from_failed(size_t start_offset, bool is_wifi_post)
             post_result = gsm_post_data(line);
         }
 
+        // #ifdef DEBUG_TEST_SECONDARY_ON_REJECT
+        // if (post_result != ESP_OK) {
+        //     ESP_LOGW("DEBUG_SEC", "Primary rejected — testing same payload against secondary for comparison");
+        //     gsm_post_secondary(line);   // fire-and-forget, purely for observing the response
+        // }
+        // #endif
+
         // if (fake_post_fail(line) == ESP_FAIL )
-         if (post_result != ESP_OK) 
+        if (post_result != ESP_OK)
         {
-            // printf("Saving failed offset: %zu (wrap=%d)\n", post_offset, wrapped_once);
-            ESP_LOGE("TRY_FAILED", "Post FAILED (err=0x%x) at offset %zu — saving state",
-                     (unsigned)post_result, post_offset);
+            post_fail_reason_t reason = get_last_post_fail_reason();
+
+            if (reason == POST_FAIL_NO_NETWORK) {
+                /* Not the record's fault — no retry limit, ever. Just try again next cycle. */
+                ESP_LOGW("TRY_FAILED", "No network — offset %zu stays queued, retrying next cycle", post_offset);
+                save_state_if_changed(post_offset, wrapped_once, true);
+                fclose(fp);
+                return failed_posting_failed_data;
+            }
+
+            /* POST_FAIL_SERVER_REJECTED — server actually answered and rejected it */
+            if (post_offset == last_failed_try_offset) {
+                same_offset_reject_count++;
+            } else {
+                last_failed_try_offset   = post_offset;
+                same_offset_reject_count = 1;
+            }
+
+            ESP_LOGE("TRY_FAILED", "Server rejected offset %zu — attempt %d/%d",
+                    post_offset, same_offset_reject_count, MAX_REJECT_RETRIES);
+
+            if (same_offset_reject_count >= MAX_REJECT_RETRIES) {
+                ESP_LOGE("TRY_FAILED", "Offset %zu rejected %d times — quarantining, skipping",
+                        post_offset, MAX_REJECT_RETRIES);
+                post_offset = ftell(fp);
+                same_offset_reject_count = 0;
+                last_failed_try_offset   = SIZE_MAX;
+                save_state_if_changed(post_offset, wrapped_once, (post_offset < curr_log_offset));
+                if (post_offset >= curr_log_offset || !fgets(line, sizeof(line), fp)) { fclose(fp); return no_failed_data; }
+                continue;
+            }
+
             save_state_if_changed(post_offset, wrapped_once, true);
             fclose(fp);
             return failed_posting_failed_data;

@@ -299,6 +299,8 @@ void MODBUS_handler( uint8_t SensorSelect, uint8_t *modbusRequest)
      len_of_response_num = (5 + num_registers * 2);
     // SensorSelect = 0;
   } 
+
+  //=============================================================
 //   else if (SensorSelect == UFM_Test) {
 
 

@@ -26,6 +26,14 @@ typedef enum {
 } post_status_t;
 
 typedef enum {
+    POST_FAIL_NONE = 0,
+    POST_FAIL_NO_NETWORK,      /* couldn't reach modem/server at all — always safe to retry */
+    POST_FAIL_SERVER_REJECTED  /* modem got a real reply from the server, and it wasn't success */
+} post_fail_reason_t;
+
+post_fail_reason_t get_last_post_fail_reason(void);
+
+typedef enum {
     CMD_AT,
     CMD_CFUN_R,
     CMD_CFUN_W,

@@ -29,6 +29,8 @@
 #include "main.h"
 #include "support.h"
 #include "wifi_handler.h"
+#include "wifi_handler.h"
+#include "wifi_ap_handler.h"
 
 #include <time.h>
 
@@ -97,7 +99,7 @@ void process_data_modbus(void);
 esp_err_t gsm_command_exe();
 void time_sync(const char *str);
 void send_all_logs();
-
+void trigger_ap_log_fetch(void);
 
 float SOLARPercentage(float voltage);
 float BatteryPercentage(float voltage);
@@ -290,7 +292,11 @@ void btn_press_handler(void *param)
 
     while (1)
     {    
-        if(!gpio_get_level(SW2))
+        if (ap_mode_active) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+		if(!gpio_get_level(SW2))
         {
             int64_t z = esp_timer_get_time();
             if ((z - x) / 1000 >= 2000 )
@@ -522,13 +528,37 @@ void process_rxd_ble_data(const char *data)
 
 	else if( data && strncmp(data, "{$send_logs}", 12) == 0)
 	{
-		send_all_logs();
+		trigger_ap_log_fetch();
+		// send_all_logs();
 		// for (int i = 0; i < (sizeof(fake_data_logs) / sizeof(fake_data_logs[0])); i++) 
 		// // for (int i = 0; i < 2; i++) 
 		// {
 		// 	status_notify_chunks(fake_data_logs[i]);
 		// 	// vTaskDelay(pdMS_TO_TICKS(100));  
 		// }
+	}
+	else if( data && strncmp(data, "{$start_ap}", 11) == 0)
+	{
+		ESP_LOGW("BLE", "Start AP mode requested...");
+		// --- ADDED VISIBLE PRINT STATEMENTS ---
+		ESP_LOGE("BLE_TEST", "========================================");
+		ESP_LOGE("BLE_TEST", "✅ COMMAND RECEIVED: {$start_ap}");
+		ESP_LOGE("BLE_TEST", "📶 AP SSID WILL BE : %s", AP_SSID);
+		ESP_LOGE("BLE_TEST", "🔑 AP PASS WILL BE : %s", AP_PASS);
+		ESP_LOGE("BLE_TEST", "========================================");
+		/* Notify app with SSID/PASS BEFORE tearing down BLE */
+		char ap_info[100];
+		snprintf(ap_info, sizeof(ap_info), "{$ap_info$SSID:%s,PASS:%s}", AP_SSID, AP_PASS);
+		status_notify_chunks(ap_info);
+		ble_notify_drain();
+
+		vTaskDelay(pdMS_TO_TICKS(300));  /* let notify flush */
+
+		/* Stop BLE fully — frees heap for WiFi AP + HTTP server */
+		stop_ble();
+
+		/* Start AP + HTTP server */
+		start_ap_mode();
 	}
 	else if( data && strncmp(data, "{$delete_logs}", 12) == 0)
 	{
@@ -856,6 +886,26 @@ void send_all_logs()
     ble_notify_drain();
 
     ESP_LOGI("send_all_logs", "Done — sent %lu logs total", (unsigned long)log_count);
+}
+
+void trigger_ap_log_fetch(void)
+{
+    ESP_LOGW("BLE", "Fetch Logs requested — starting WiFi AP mode...");
+
+    /* Notify app with SSID/PASS BEFORE tearing down BLE (best-effort —
+       app doesn't need to display this since AP_SSID/AP_PASS are fixed) */
+    char ap_info[100];
+    snprintf(ap_info, sizeof(ap_info), "{$ap_info$SSID:%s,PASS:%s}", AP_SSID, AP_PASS);
+    status_notify_chunks(ap_info);
+    ble_notify_drain();
+
+    vTaskDelay(pdMS_TO_TICKS(300));  /* let notify flush */
+
+    /* Stop BLE fully — frees heap for WiFi AP + HTTP server */
+    stop_ble();
+
+    /* Start AP + HTTP server */
+    start_ap_mode();
 }
 
 int uart_vprintf(const char *fmt, va_list args)
@@ -1982,6 +2032,10 @@ void backlog_post_task(void *pvParameters)
         /* Wake when main loop has stored a fresh SPIFFS log. */
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
+		if (ap_mode_active) {
+            continue;  /* don't post while serving file */
+        }
+
         /* Skip aggressive retries when battery guard blocks posting. */
         if (status.battery_level < 20.0f) {
             ESP_LOGW("POST_WORKER", "Battery %.2f%% < 20%%, deferring backlog post retry.", status.battery_level);
@@ -2002,7 +2056,7 @@ void backlog_post_task(void *pvParameters)
            This preserves quick drain without tight flooding loops. */
         if (get_is_failed() && status.battery_level >= 20.0f) {
             // vTaskDelay(pdMS_TO_TICKS(300));
-			vTaskDelay(pdMS_TO_TICKS(1000));    // 1s gap between backlog retries for burst mode
+			vTaskDelay(pdMS_TO_TICKS(15000));   // CHANGED: 1000 → 15000
             xTaskNotifyGive(backlog_post_task_handle);
         }
     }
@@ -2175,6 +2229,16 @@ void sensor_modbus_requests()
         printf("CRC mismatch! Expected: 0x%04X, Got: 0x%04X\n", crc_calc, crc_recv);
         return;
     }
+	
+	// --- NEW: verify the reply actually came from the slave/function we just addressed ---
+    if (resp[0] != modbus_arr[0] || resp[1] != modbus_arr[1]) {
+        print_sensor_name(SensorSelect);
+        modbus_response_status[SensorSelect] = false;
+        printf("Cross-talk/stale frame! Expected slave 0x%02X fn 0x%02X, got slave 0x%02X fn 0x%02X\n",
+               modbus_arr[0], modbus_arr[1], resp[0], resp[1]);
+        return;
+    }
+    // -----------------------------------------------------------------------
 
     uint8_t byte_count = resp[2];
     if (byte_count != (resp_len - 5)) {
@@ -3026,6 +3090,17 @@ void app_main(void)
 
 	while (1)
 	{
+		/* ── AP mode: idle everything, wait for download + restart ──────── */
+		if (ap_mode_active) {
+			if (ap_download_done) {
+				ESP_LOGW("MAIN-AP", "Download finished — restarting in 2s");
+				vTaskDelay(pdMS_TO_TICKS(2000));
+				esp_restart();
+			}
+			vTaskDelay(pdMS_TO_TICKS(200));
+			continue;
+		}
+
 		uint64_t now     = millis();
 		uint64_t elapsed = now - start;
 

@@ -262,29 +262,18 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
             break;
         case BLE_GAP_EVENT_DISCONNECT:
             ESP_LOGI("GAP", "BLE GAP EVENT DISCONNECTED");
-                esp_restart();  // Reboots the ESP32
-            	nimble_port_stop();
-		        nimble_port_deinit();
-                ble_connected = false;
-    
-            
-            if (ble_stop_requested) 
-			{
-		        ble_stop_requested = false;
-		
-		        ESP_LOGI(TAG1, "Finalizing BLE shutdown after disconnect...");
-		
-		        nimble_port_stop();
-		        nimble_port_deinit();
-		        ESP_LOGI(TAG1, "BLE fully stopped and memory released.");
-		       
-		    }
-		    else 
-		    {
-                ESP_LOGI(TAG1, "BLE - Waiting for connection");
-		        ble_app_advertise();  // resume advertising if not shutting down
-		    }
-		    
+            ble_connected = false;
+
+            if (ble_stop_requested) {
+                /* Deliberate shutdown via stop_ble() — the 5-min idle timeout,
+                   or the new {$start_ap} handover. Let stop_ble()'s wait loop
+                   finish the job; do NOT reboot here. */
+                ble_stop_requested = false;
+                ESP_LOGI(TAG1, "Graceful BLE disconnect — stop_ble() finalizing shutdown");
+                break;
+            }
+
+            esp_restart();  // Reboots the ESP32 — unchanged for a normal/unexpected disconnect
             break;
         case BLE_GAP_EVENT_ADV_COMPLETE:
             ESP_LOGI("GAP", "BLE GAP EVENT ADV COMPLETE");
@@ -619,8 +608,16 @@ void stop_ble(void)
         if (rc != 0) {
             ESP_LOGE(TAG1, "Failed to disconnect, err=%d", rc);
         } else {
-            ble_stop_requested = true; // Wait for disconnect event to finalize shutdown
-            return;
+            ble_stop_requested = true;
+            /* Wait for the GAP disconnect event to clear ble_connected.
+               Bounded (~5s) so a missed event can never hang the caller
+               forever on an unattended remote device. */
+            int wait_cycles = 0;
+            while (ble_connected && wait_cycles < 100) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                wait_cycles++;
+            }
+            ble_connected = false;   // failsafe if the event never arrived
         }
     }
 
@@ -628,12 +625,8 @@ void stop_ble(void)
     ESP_LOGI(TAG1, "No active connection. Finalizing BLE shutdown...");
 
     nimble_port_stop();
-    
-    // Wait for stack to stop (optional, can also check a flag)
 	vTaskDelay(pdMS_TO_TICKS(100));
-    
     nimble_port_deinit();
-	// esp_nimble_hci_and_controller_deinit();
     ble_connected = false;
     ESP_LOGI(TAG1, "BLE fully stopped and memory released.");
 }
